@@ -209,6 +209,37 @@ def run_cmd(cmd: list[str], env: dict | None = None) -> tuple[int, str]:
     return p.returncode, (p.stdout + "\n" + p.stderr).strip()
 
 
+# Compute tests that print out[0..7] (vk_compute_test ... dump) and the words they must give. Every one but cs_store
+# is a whole-wave (wave64) mask test: it asks for a 64-wide subgroup and is skipped, as in check.py, where the device
+# has none (vk_compute_test exits 77) instead of being reported as a failure.
+CS_DUMP_WANTS = {
+    "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
+    "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
+    "cs_wm_half_ops": [32, 16, 16, 0, 16],
+    "cs_wm_half_cmp": [1, 0, 1, 1],
+    "cs_wm_bfm64": [16, 8, 8, 40],
+    "cs_wm_scc_rfl": [55, 48],
+}
+NEEDS_WAVE64 = frozenset(CS_DUMP_WANTS) - {"cs_store"}
+
+
+def run_cs_dump(vk_compute: str, spv: str, name: str, env: dict | None = None) -> tuple[bool | None, str]:
+    """Run one dump test. Returns (True, words) or (False, why); ok is None when the device can't run it."""
+    want = CS_DUMP_WANTS[name]
+    wave64 = name in NEEDS_WAVE64
+    rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=env)
+    if wave64 and rc == 77:
+        return None, "SKIP (no 64-wide compute subgroup on this device)"
+    dump = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", msg, re.MULTILINE)   # eight decimal words, as check.py
+    if rc != 0 or not dump:
+        return False, msg
+    if wave64 and "compute subgroup size: 64" not in msg.splitlines():   # as check.py: the flag was really honoured
+        return False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
+    vals = [int(x) for x in dump.group(1).split()[:len(want)]]
+    fmt = hex if name == "cs_store" else str
+    return vals == want, " ".join(fmt(x) for x in vals)
+
+
 def check_pixel_const(raw_path: str, want: tuple[int, int, int, int]) -> tuple[bool, str]:
     px = read_raw_u32(raw_path)
     if len(px) != 64 * 64:
@@ -397,30 +428,9 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_bvh":
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name in ("cs_store", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl"):
-            cs_dump_wants = {
-                "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
-                "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
-                "cs_wm_half_ops": [32, 16, 16, 0, 16],
-                "cs_wm_half_cmp": [1, 0, 1, 1],
-                "cs_wm_bfm64": [16, 8, 8, 40],
-                "cs_wm_scc_rfl": [55, 48],
-            }
-            want = cs_dump_wants[name]
-            # Every dump but cs_store is a whole-wave (wave64) mask test: ask for a 64-wide subgroup and skip, as
-            # check.py does, where the device has none (vk_compute_test exits 77) instead of reporting a failure.
-            wave64 = name != "cs_store"
-            rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
-            dump_line = next((ln for ln in msg.splitlines() if "out[0..7] =" in ln), "")
-            if wave64 and rc == 77:
-                results.append((name, None, "SKIP (no 64-wide compute subgroup on this device)"))
-            elif rc == 0 and dump_line:
-                vals = [int(x) for x in dump_line.split("=")[1].split()[:len(want)]]
-                ok = vals == want
-                fmt = hex if name == "cs_store" else str
-                results.append((name, ok, " ".join(fmt(x) for x in vals)))
-            else:
-                results.append((name, False, msg))
+        elif name in CS_DUMP_WANTS:
+            ok, detail = run_cs_dump(vk_compute, spv, name, cs_env)
+            results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
