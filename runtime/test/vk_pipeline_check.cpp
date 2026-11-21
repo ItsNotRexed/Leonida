@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -62,7 +63,15 @@ namespace {
 struct JsonParser {
     const std::string& s;
     size_t i = 0;
+    bool error = false;
+    std::string error_msg;
 
+    void fail(const char* ctx) {
+        if (!error) {
+            error = true;
+            error_msg = std::string(ctx) + " at byte " + std::to_string(i);
+        }
+    }
     void ws() {
         while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) i++;
     }
@@ -73,7 +82,7 @@ struct JsonParser {
     }
     std::string parse_string() {
         ws();
-        if (i >= s.size() || s[i] != '"') return {};
+        if (i >= s.size() || s[i] != '"') { fail("expected string"); return {}; }
         i++;
         std::string out;
         while (i < s.size() && s[i] != '"') {
@@ -84,18 +93,22 @@ struct JsonParser {
                 out.push_back(s[i++]);
             }
         }
-        if (i < s.size() && s[i] == '"') i++;
+        if (i >= s.size() || s[i] != '"') { fail("unterminated string"); return out; }
+        i++;
         return out;
     }
     uint32_t parse_u32() {
         ws();
+        const size_t start = i;
         bool neg = false;
         if (i < s.size() && s[i] == '-') { neg = true; i++; }
         uint32_t v = 0;
+        const size_t digits_start = i;
         while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
             v = v * 10 + uint32_t(s[i] - '0');
             i++;
         }
+        if (i == digits_start) { i = start; fail("expected unsigned integer"); return 0u; }
         while (i < s.size() && (s[i] == '.' || s[i] == 'e' || s[i] == 'E' || s[i] == '+' || s[i] == '-' ||
                                 (s[i] >= '0' && s[i] <= '9'))) i++;
         return neg ? 0u : v;
@@ -104,87 +117,118 @@ struct JsonParser {
         ws();
         if (s.compare(i, 4, "true") == 0) { i += 4; return true; }
         if (s.compare(i, 5, "false") == 0) { i += 5; return false; }
+        fail("expected boolean");
         return false;
     }
     void skip_value() {
         ws();
-        if (i >= s.size()) return;
+        if (i >= s.size()) { fail("unexpected end of JSON"); return; }
         char c = s[i];
         if (c == '"') { parse_string(); return; }
         if (c == '{') {
             i++;
-            while (i < s.size()) {
+            while (!error && i < s.size()) {
                 if (consume('}')) return;
+                const size_t before = i;
                 parse_string();
-                consume(':');
+                if (error) return;
+                if (!consume(':')) { fail("expected ':' in object"); return; }
                 skip_value();
-                consume(',');
+                if (error) return;
+                if (consume('}')) return;
+                if (!consume(',') || i == before) { fail("expected ',' or '}' in object"); return; }
             }
+            if (!error) fail("unterminated object");
             return;
         }
         if (c == '[') {
             i++;
-            while (i < s.size()) {
+            while (!error && i < s.size()) {
                 if (consume(']')) return;
+                const size_t before = i;
                 skip_value();
-                consume(',');
+                if (error) return;
+                if (consume(']')) return;
+                if (!consume(',') || i == before) { fail("expected ',' or ']' in array"); return; }
             }
+            if (!error) fail("unterminated array");
             return;
         }
+        const size_t before = i;
         while (i < s.size() && s[i] != ',' && s[i] != '}' && s[i] != ']' &&
                !std::isspace(static_cast<unsigned char>(s[i]))) i++;
+        if (i == before) fail("unexpected token in value");
     }
     std::vector<uint32_t> parse_u32_array() {
         std::vector<uint32_t> out;
         if (!consume('[')) { skip_value(); return out; }
-        while (i < s.size()) {
-            if (consume(']')) break;
+        while (!error && i < s.size()) {
+            if (consume(']')) return out;
+            const size_t before = i;
             out.push_back(parse_u32());
-            consume(',');
+            if (error) return out;
+            if (consume(']')) return out;
+            if (!consume(',') || i == before) { fail("expected ',' or ']' in u32 array"); return out; }
         }
+        if (!error) fail("unterminated u32 array");
         return out;
     }
     std::vector<std::string> parse_str_array() {
         std::vector<std::string> out;
         if (!consume('[')) { skip_value(); return out; }
-        while (i < s.size()) {
-            if (consume(']')) break;
+        while (!error && i < s.size()) {
+            if (consume(']')) return out;
+            const size_t before = i;
             out.push_back(parse_string());
-            consume(',');
+            if (error) return out;
+            if (consume(']')) return out;
+            if (!consume(',') || i == before) { fail("expected ',' or ']' in string array"); return out; }
         }
+        if (!error) fail("unterminated string array");
         return out;
     }
     std::vector<VertexInputMeta> parse_vertex_inputs() {
         std::vector<VertexInputMeta> out;
         if (!consume('[')) { skip_value(); return out; }
-        while (i < s.size()) {
-            if (consume(']')) break;
+        while (!error && i < s.size()) {
+            if (consume(']')) return out;
+            const size_t before = i;
             VertexInputMeta vi;
             if (consume('{')) {
-                while (i < s.size()) {
+                while (!error && i < s.size()) {
                     if (consume('}')) break;
+                    const size_t obj_before = i;
                     std::string k = parse_string();
-                    consume(':');
+                    if (error) return out;
+                    if (!consume(':')) { fail("expected ':' in vertex_inputs entry"); return out; }
                     if (k == "location") vi.location = parse_u32();
                     else if (k == "type") vi.type = parse_string();
                     else skip_value();
-                    consume(',');
+                    if (error) return out;
+                    if (consume('}')) break;
+                    if (!consume(',') || i == obj_before) { fail("expected ',' or '}' in vertex_inputs entry"); return out; }
                 }
+                if (error) return out;
                 out.push_back(std::move(vi));
             } else {
                 skip_value();
+                if (error) return out;
             }
-            consume(',');
+            if (consume(']')) return out;
+            if (!consume(',') || i == before) { fail("expected ',' or ']' in vertex_inputs"); return out; }
         }
+        if (!error) fail("unterminated vertex_inputs array");
         return out;
     }
     ShaderMeta parse_meta() {
         ShaderMeta m;
         if (!consume('{')) { skip_value(); return m; }
-        while (i < s.size()) {
-            if (consume('}')) break;
+        while (!error && i < s.size()) {
+            if (consume('}')) return m;
+            const size_t before = i;
             std::string k = parse_string();
-            consume(':');
+            if (error) return m;
+            if (!consume(':')) { fail("expected ':' in shader metadata"); return m; }
             if (k == "stage") m.stage = parse_string();
             else if (k == "subgroup_size") m.subgroup_size = parse_u32();
             else if (k == "writes_depth") m.writes_depth = parse_bool();
@@ -199,26 +243,37 @@ struct JsonParser {
             else if (k == "gs_output_locations") { m.gs_output_locations = parse_u32_array(); m.has_gs_output_locations = true; }
             else if (k == "vertex_inputs") m.vertex_inputs = parse_vertex_inputs();
             else skip_value();
-            consume(',');
+            if (error) return m;
+            if (consume('}')) return m;
+            if (!consume(',') || i == before) { fail("expected ',' or '}' in shader metadata"); return m; }
         }
+        if (!error) fail("unterminated shader metadata object");
         return m;
     }
 };
 
-std::map<std::string, ShaderMeta> read_index(const std::string& path) {
+std::map<std::string, ShaderMeta> read_index(const std::string& path, std::string& err) {
     std::ifstream f(path, std::ios::binary);
     std::string s((std::istreambuf_iterator<char>(f)), {});
     std::map<std::string, ShaderMeta> out;
     JsonParser p{s, 0};
-    if (!p.consume('{')) return out;
-    while (p.i < s.size()) {
-        if (p.consume('}')) break;
+    p.ws();
+    if (p.i >= s.size()) return out;
+    if (!p.consume('{')) { err = "expected '{' at byte " + std::to_string(p.i); return out; }
+    while (!p.error && p.i < s.size()) {
+        if (p.consume('}')) return out;
+        const size_t before = p.i;
         std::string name = p.parse_string();
-        if (!p.consume(':')) break;
+        if (p.error) break;
+        if (!p.consume(':')) { p.fail("expected ':' after shader name"); break; }
         out[name] = p.parse_meta();
-        p.consume(',');
+        if (p.error) break;
+        if (p.consume('}')) return out;
+        if (!p.consume(',') || p.i == before) { p.fail("expected ',' or '}' in index.json"); break; }
     }
-    return out;
+    if (p.error) { err = p.error_msg; return {}; }
+    err = "unterminated top-level object at byte " + std::to_string(p.i);
+    return {};
 }
 
 std::string stub_filename(const char* kind, const std::vector<uint32_t>& raw_locs) {
@@ -248,14 +303,25 @@ std::string upper_stage(const std::string& st) {
     return u;
 }
 
+VkShaderStageFlagBits stage_bit(const std::string& st) {
+    if (st == "cs") return VK_SHADER_STAGE_COMPUTE_BIT;
+    if (st == "ps") return VK_SHADER_STAGE_FRAGMENT_BIT;
+    if (st == "vs") return VK_SHADER_STAGE_VERTEX_BIT;
+    if (st == "ms") return VK_SHADER_STAGE_MESH_BIT_EXT;
+    if (st == "gs") return VK_SHADER_STAGE_GEOMETRY_BIT;
+    return VkShaderStageFlagBits(0);
+}
+
 struct StageStats {
     uint32_t pipes_ok = 0;
     uint32_t pipes_bad = 0;
     uint32_t pipes_skipped = 0;
     uint32_t w32_ok = 0;
     uint32_t w32_bad = 0;
+    uint32_t w32_unforced = 0;
     uint32_t w64_ok = 0;
     uint32_t w64_bad = 0;
+    uint32_t w64_unforced = 0;
     double seconds = 0.0;
     double max_sec = 0.0;
     std::string max_name;
@@ -295,7 +361,12 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    auto index = read_index(dir + "/index.json");
+    std::string index_err;
+    auto index = read_index(dir + "/index.json", index_err);
+    if (!index_err.empty()) {
+        std::fprintf(stderr, "error: malformed JSON in %s/index.json: %s\n", dir.c_str(), index_err.c_str());
+        return 2;
+    }
     std::fprintf(stderr, "%zu shaders in index\n", index.size());
 
     // Build work list: index order (sorted by name), optionally filtered by stage, then [start, start + count).
@@ -383,7 +454,7 @@ int main(int argc, char** argv) {
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
     const bool ext_m8 = link(&m8, reinterpret_cast<VkBaseOutStructure*>(&m8), VK_KHR_MAINTENANCE_8_EXTENSION_NAME, want_m8);
 #else
-    const bool ext_m8 = false;
+    (void)want_m8;
 #endif
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = chain;
@@ -400,6 +471,31 @@ int main(int argc, char** argv) {
     dci.enabledExtensionCount = uint32_t(enable.size()); dci.ppEnabledExtensionNames = enable.data();
     VkDevice dev;
     if (VkResult r = vkCreateDevice(pd, &dci, nullptr, &dev)) { std::fprintf(stderr, "vkCreateDevice %d\n", r); return 1; }
+    auto can_require_sg = [&](uint32_t sg, VkShaderStageFlagBits bit) -> bool {
+        return f13.subgroupSizeControl &&
+               sg >= sgProps.minSubgroupSize &&
+               sg <= sgProps.maxSubgroupSize &&
+               (sgProps.requiredSubgroupSizeStages & bit);
+    };
+    {
+        std::map<uint32_t, std::set<std::string>> unforced_by_sg;
+        for (const auto& [_, meta] : work) {
+            const VkShaderStageFlagBits bit = stage_bit(meta->stage);
+            if (bit && meta->subgroup_size > 0 && !can_require_sg(meta->subgroup_size, bit)) {
+                unforced_by_sg[meta->subgroup_size].insert(meta->stage);
+            }
+        }
+        for (const auto& [sg, stages] : unforced_by_sg) {
+            std::string list;
+            for (const auto& st : stages) {
+                if (!list.empty()) list += "/";
+                list += st;
+            }
+            std::fprintf(stderr,
+                "note: %u-wide subgroups not supported for %s; those pipelines are compiled without a required subgroup size\n",
+                sg, list.c_str());
+        }
+    }
 #define LOADD(name) auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(dev, #name))
     LOADD(vkCreateShaderModule); LOADD(vkDestroyShaderModule); LOADD(vkCreateDescriptorSetLayout);
     LOADD(vkCreatePipelineLayout); LOADD(vkCreateComputePipelines); LOADD(vkCreateGraphicsPipelines);
@@ -522,13 +618,17 @@ int main(int argc, char** argv) {
         std::printf("SKIPPED %s (%s)\n", name.c_str(), reason.c_str());
     };
 
-    auto record_pipe = [&](const std::string& name, const std::string& stage, uint32_t sg, VkResult r, double sec) {
+    auto record_pipe = [&](const std::string& name, const std::string& stage, uint32_t sg, bool sg_forced,
+                           VkResult r, double sec) {
         std::lock_guard<std::mutex> g(mu);
         inflight.erase(std::this_thread::get_id());
         auto& st = stats[stage];
         st.seconds += sec;
         if (sec > st.max_sec) { st.max_sec = sec; st.max_name = name; }
         if (sec > slow) std::printf("SLOW %s %s (w%u, %.1fs)\n", upper_stage(stage).c_str(), name.c_str(), sg, sec);
+        if (sg > 0 && !sg_forced) {
+            if (sg == 64) st.w64_unforced++; else st.w32_unforced++;
+        }
         if (r) {
             st.pipes_bad++;
             if (sg == 64) st.w64_bad++; else st.w32_bad++;
@@ -539,13 +639,6 @@ int main(int argc, char** argv) {
         }
         uint32_t n_done = ++total_pipes_done;
         if (n_done % 250 == 0) std::fprintf(stderr, "  pipelines %u (%.0fs elapsed)\n", n_done, elapsed());
-    };
-
-    auto can_require_sg = [&](uint32_t sg, VkShaderStageFlagBits bit) -> bool {
-        return f13.subgroupSizeControl &&
-               sg >= sgProps.minSubgroupSize &&
-               sg <= sgProps.maxSubgroupSize &&
-               (sgProps.requiredSubgroupSizeStages & bit);
     };
 
     auto worker = [&] {
@@ -590,7 +683,8 @@ int main(int argc, char** argv) {
                     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
                     cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
                     cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cpi.stage.module = sm; cpi.stage.pName = "main";
-                    if (can_require_sg(meta.subgroup_size, VK_SHADER_STAGE_COMPUTE_BIT)) cpi.stage.pNext = &reqSg;
+                    const bool sg_forced = can_require_sg(meta.subgroup_size, VK_SHADER_STAGE_COMPUTE_BIT);
+                    if (sg_forced) cpi.stage.pNext = &reqSg;
                     cpi.layout = pl;
                     const auto t0 = std::chrono::steady_clock::now();
                     { std::lock_guard<std::mutex> g(mu); inflight[std::this_thread::get_id()] = {name, t0}; }
@@ -598,7 +692,7 @@ int main(int argc, char** argv) {
                     VkResult r = vkCreateComputePipelines(dev, cache, 1, &cpi, nullptr, &p);
                     const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                     if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
-                    record_pipe(name, stage, meta.subgroup_size, r, sec);
+                    record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec);
                 }
             } else if (mod_ok && is_graphics_stage(stage)) {
                 const std::string miss = check_missing_feature(meta);
@@ -610,10 +704,14 @@ int main(int argc, char** argv) {
                         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
                     reqSg.requiredSubgroupSize = meta.subgroup_size;
 
+                    bool sg_forced = false;
                     auto make_stage = [&](VkShaderStageFlagBits bit, VkShaderModule mod, bool real) {
                         VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
                         si.stage = bit; si.module = mod; si.pName = "main";
-                        if (real && can_require_sg(meta.subgroup_size, bit)) si.pNext = &reqSg;
+                        if (real && can_require_sg(meta.subgroup_size, bit)) {
+                            si.pNext = &reqSg;
+                            sg_forced = true;
+                        }
                         return si;
                     };
 
@@ -756,7 +854,7 @@ int main(int argc, char** argv) {
                         VkResult r = vkCreateGraphicsPipelines(dev, cache, 1, &gpci, nullptr, &p);
                         const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                         if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
-                        record_pipe(name, stage, meta.subgroup_size, r, sec);
+                        record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec);
                     }
                 }
             } else if (mod_ok) {
@@ -772,22 +870,32 @@ int main(int argc, char** argv) {
     std::vector<std::thread> pool;
     for (uint32_t t = 0; t < jobs; t++) pool.emplace_back(worker);
     // Watchdog: names every compile running past 60 s (about once a minute) and saves the cache every 10 minutes.
+    std::condition_variable watch_cv;
+    bool all_done = false;
     std::thread watch([&] {
         auto last_save = std::chrono::steady_clock::now();
-        while (done < work.size()) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::unique_lock<std::mutex> g(mu);
+        while (!all_done) {
+            if (watch_cv.wait_for(g, std::chrono::seconds(5), [&] { return all_done; })) break;
             const auto now = std::chrono::steady_clock::now();
-            {
-                std::lock_guard<std::mutex> g(mu);
-                for (auto& [tid, job] : inflight) {
-                    const double s = std::chrono::duration<double>(now - job.second).count();
-                    if (s > 60 && int(s) % 60 < 5) std::fprintf(stderr, "  still compiling %s after %.0fs\n", job.first.c_str(), s);
-                }
+            for (auto& [tid, job] : inflight) {
+                const double s = std::chrono::duration<double>(now - job.second).count();
+                if (s > 60 && int(s) % 60 < 5) std::fprintf(stderr, "  still compiling %s after %.0fs\n", job.first.c_str(), s);
             }
-            if (now - last_save > std::chrono::minutes(10)) { save_cache(false); last_save = now; }
+            if (now - last_save > std::chrono::minutes(10)) {
+                g.unlock();
+                save_cache(false);
+                g.lock();
+                last_save = now;
+            }
         }
     });
     for (auto& t : pool) t.join();
+    {
+        std::lock_guard<std::mutex> g(mu);
+        all_done = true;
+    }
+    watch_cv.notify_one();
     watch.join();
 
     for (auto& [_, mod] : stub_cache) if (mod) vkDestroyShaderModule(dev, mod, nullptr);
@@ -810,8 +918,13 @@ int main(int argc, char** argv) {
                     std::printf("  %s skipped (%s): %u\n", st.c_str(), reason.c_str(), cnt);
             }
             if (compiled > 0) {
-                std::printf("  %s wave32: %u ok, %u failed; wave64: %u ok, %u failed\n",
-                            st.c_str(), s.w32_ok, s.w32_bad, s.w64_ok, s.w64_bad);
+                auto fmt_unforced = [](uint32_t cnt) -> std::string {
+                    return cnt ? (" (" + std::to_string(cnt) + " without required subgroup size)") : "";
+                };
+                std::printf("  %s wave32: %u ok, %u failed%s; wave64: %u ok, %u failed%s\n",
+                            st.c_str(),
+                            s.w32_ok, s.w32_bad, fmt_unforced(s.w32_unforced).c_str(),
+                            s.w64_ok, s.w64_bad, fmt_unforced(s.w64_unforced).c_str());
                 std::printf("  %s compile time: %.2fs total, %.3fs mean, slowest %s (%.2fs)\n",
                             st.c_str(), s.seconds, s.seconds / compiled, s.max_name.c_str(), s.max_sec);
             }
