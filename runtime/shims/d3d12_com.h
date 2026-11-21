@@ -15,6 +15,9 @@
 #include "../src/vulkan_backend.h"
 
 #include <memory>
+#include <string>
+
+#include "../src/root_signature.h"
 
 namespace leonida {
 class VulkanPresenter;
@@ -43,6 +46,12 @@ struct VulkanDeviceInfo {
     std::uint32_t queue_family = 0;
     bool separate_depth_stencil_layouts = true;
     bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
+    // bufferDeviceAddress enabled: buffers and shader-visible heaps then live in the GPU address arena and have
+    // console VAs (docs section 3.3); without it, GetGPUVirtualAddress returns 0 and pipelines cannot be created.
+    bool buffer_device_address = false;
+    // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
+    // LEONIDA_SHADERS environment variable.
+    std::string shader_dir;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -82,6 +91,11 @@ private:
 
 // Null when `device` is not a Vulkan device created with presentation, or the window cannot be presented to.
 std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window);
+
+// For the command list: the parsed layout of a root signature from a Vulkan device, and the id it records for a
+// compute pipeline state (0: not a compute PSO of a Vulkan device).
+const leonida::RootSignatureLayout* root_signature_layout(ID3D12RootSignature* signature);
+std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);

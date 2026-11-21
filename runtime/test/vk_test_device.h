@@ -183,7 +183,7 @@ public:
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features12};
         instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &features);
         if (!features13.dynamicRendering || !features13.synchronization2 || !features12.timelineSemaphore ||
-            !features12.separateDepthStencilLayouts) {
+            !features12.separateDepthStencilLayouts || !features12.bufferDeviceAddress) {
             std::fprintf(stderr, "the device lacks dynamicRendering, synchronization2, timelineSemaphore or "
                                  "separateDepthStencilLayouts\n");
             return false;
@@ -194,6 +194,7 @@ public:
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
+        enable12.bufferDeviceAddress = VK_TRUE;
 
         const float priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};

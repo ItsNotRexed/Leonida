@@ -98,6 +98,8 @@ when the Vulkan SDK is found:
 - GPU tests count only validation-type errors. Loader and layer messages, such as a third-party implicit layer
   that fails to load, are printed but don't fail the run; to silence one, set
   `VK_LOADER_LAYERS_DISABLE=<layer name pattern>`.
+- `d3d12_compute_test` — the compute path: root signature, a compute PSO found by its FSSM hash in a
+  translator-style index, root arguments through the GPU address arena, and two dispatches.
 - `d3d12_present_test` — milestone M0: opens a window and presents 60 cleared frames through the proxy on
   Vulkan, resizes it, and checks the colour on screen. Set
   `LEONIDA_VK_VALIDATION=1` to run them under the Khronos validation layer.
