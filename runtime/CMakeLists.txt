@@ -17,6 +17,18 @@ if(WIN32)
   target_compile_definitions(gta6rt_d3d12_xs_rootsig PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(gta6rt_d3d12_xs_rootsig PRIVATE /W4 /permissive- /utf-8)
 
+  # Reserves one loader-assigned module TLS index for mapped images. Loaded from the executable's directory by
+  # Loader::initialize_tls; its trivial DllMain only keeps the TLS anchor in the image. Built in the same directory as
+  # the executables that map images, because the loader looks for it next to the running EXE.
+  add_library(gta6rt_tls_host SHARED src/tls_host.cpp)
+  target_compile_options(gta6rt_tls_host PRIVATE /W4 /permissive- /utf-8 /GS-)
+  target_compile_definitions(gta6rt_tls_host PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  set_target_properties(gta6rt_tls_host PROPERTIES
+    OUTPUT_NAME gta6rt_tls_host
+    PREFIX ""
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+  )
+
   add_executable(gta6rt
     src/main.cpp
     src/pe_loader.cpp
@@ -25,6 +37,7 @@ if(WIN32)
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
   )
+  add_dependencies(gta6rt gta6rt_tls_host)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
   # Static shim tables register themselves at startup; keep the linker from dropping their objects.
@@ -105,6 +118,7 @@ if(BUILD_TESTING)
     target_compile_definitions(loader_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
     target_compile_options(loader_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(loader_test PRIVATE /OPT:NOREF)
+    add_dependencies(loader_test gta6rt_tls_host)
     add_test(NAME loader COMMAND loader_test)
     # PE loader tests use two locally built fixtures: a DLL with exports, imports and relocations, and an EXE that
     # imports it so Loader::load exercises recursive module loading. They contain no game data.
@@ -150,8 +164,50 @@ if(BUILD_TESTING)
     target_compile_options(pe_loader_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(pe_loader_test PRIVATE /OPT:NOREF)
     target_link_libraries(pe_loader_test PRIVATE gta6rt_d3d12_xs_rootsig psapi)
-    add_dependencies(pe_loader_test tiny_dll tiny_exe)
+    add_dependencies(pe_loader_test tiny_dll tiny_exe gta6rt_tls_host)
     add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
+
+    # Static TLS and unwind fixtures: a DLL with __declspec(thread) and a TLS callback, and a DLL that throws from
+    # mapped code. Both are ordinary test code; no game data is involved. loader_tls_test needs gta6rt_tls_host.dll
+    # next to its own EXE, because that is where Loader::initialize_tls looks for the reserved module TLS index.
+    add_library(tiny_tls SHARED test/fixtures/tiny_tls.cpp)
+    target_compile_definitions(tiny_tls PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_tls PRIVATE /W4 /permissive- /utf-8 /GS-)
+    set_target_properties(tiny_tls PROPERTIES
+      OUTPUT_NAME tiny_tls
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+
+    add_library(tiny_throw SHARED test/fixtures/tiny_throw.cpp)
+    target_compile_definitions(tiny_throw PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    # /EHsc- clears /EHc: this extern "C" export really throws, so the compiler must not assume it cannot.
+    target_compile_options(tiny_throw PRIVATE /W4 /permissive- /utf-8 /GS- /EHsc-)
+    set_target_properties(tiny_throw PROPERTIES
+      OUTPUT_NAME tiny_throw
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+
+    # pe_loader.cpp needs the shim registry for shims::find/make_unimplemented_thunk. The fixtures import only host
+    # DLLs, so no shim tables are linked.
+    add_executable(loader_tls_test
+      test/loader_tls_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(loader_tls_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/shims
+    )
+    target_compile_definitions(loader_tls_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(loader_tls_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    add_dependencies(loader_tls_test tiny_tls tiny_throw gta6rt_tls_host)
+    add_test(NAME loader_tls
+      COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>" "$<TARGET_FILE:tiny_throw>"
+    )
   endif()
 
   if(TARGET device_proxy_test)
@@ -172,6 +228,7 @@ if(BUILD_TESTING)
     target_compile_options(bink_decode_test PRIVATE /W4 /permissive- /EHsc /utf-8)
     target_link_options(bink_decode_test PRIVATE /OPT:NOREF)
     target_link_libraries(bink_decode_test PRIVATE psapi)
+    add_dependencies(bink_decode_test gta6rt_tls_host)
     add_test(NAME bink_decode COMMAND bink_decode_test)
 
     # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE_AUDIO are set.
@@ -186,6 +243,7 @@ if(BUILD_TESTING)
     target_compile_options(bink_audio_test PRIVATE /W4 /permissive- /EHsc /utf-8)
     target_link_options(bink_audio_test PRIVATE /OPT:NOREF)
     target_link_libraries(bink_audio_test PRIVATE psapi)
+    add_dependencies(bink_audio_test gta6rt_tls_host)
     add_test(NAME bink_audio COMMAND bink_audio_test)
   endif()
   if(WIN32 AND TARGET xmem_test)
