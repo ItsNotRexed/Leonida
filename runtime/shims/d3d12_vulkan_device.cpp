@@ -6,10 +6,15 @@
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
+#include "../src/vulkan_present.h"
+
+#include <vulkan/vulkan_win32.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <iterator>
+#include <map>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -111,6 +116,77 @@ struct DeviceState {
     VkPhysicalDeviceMemoryProperties memory{};
     PFN_vkGetPhysicalDeviceFormatProperties format_properties = nullptr;
 
+    // The GPU address arena (docs/d3d12_vulkan.md section 3.3): one host-visible, device-addressable VkBuffer that
+    // stands in for the console's GPU address space. A console VA is an offset in it, and heap_base (push-constant
+    // dwords 32-33) is its device address. It is at most 4 GiB, so every VA fits the 32-bit descriptor-table
+    // pointers some shaders use. The first 64 KiB are never handed out, so no resource has VA 0.
+    struct Arena {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        std::uint8_t* mapped = nullptr;
+        VkDeviceAddress address = 0;
+        VkDeviceSize size = 0;
+        std::mutex mutex;
+        std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size
+    } arena;
+
+    bool arena_allocate(VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& out) {
+        std::lock_guard lock(arena.mutex);
+        for (auto it = arena.free.begin(); it != arena.free.end(); ++it) {
+            const VkDeviceSize start = (it->first + alignment - 1) / alignment * alignment;
+            const VkDeviceSize end = it->first + it->second;
+            if (start + bytes > end) continue;
+            const VkDeviceSize block = it->first;
+            arena.free.erase(it);
+            if (start > block) arena.free[block] = start - block;
+            if (start + bytes < end) arena.free[start + bytes] = end - (start + bytes);
+            out = start;
+            return true;
+        }
+        return false;
+    }
+
+    void arena_release(VkDeviceSize offset, VkDeviceSize bytes) {
+        std::lock_guard lock(arena.mutex);
+        auto it = arena.free.emplace(offset, bytes).first;
+        if (auto next = std::next(it); next != arena.free.end() && it->first + it->second == next->first) {
+            it->second += next->second;
+            arena.free.erase(next);
+        }
+        if (it != arena.free.begin()) {
+            if (auto previous = std::prev(it); previous->first + previous->second == it->first) {
+                previous->second += it->second;
+                arena.free.erase(it);
+            }
+        }
+    }
+
+    // The translator's output, loaded on first use.
+    std::mutex library_mutex;
+    bool library_tried = false;
+    leonida::ShaderLibrary shader_library;
+
+    const leonida::ShaderLibrary* library() {
+        std::lock_guard lock(library_mutex);
+        if (!library_tried) {
+            library_tried = true;
+            std::string dir = info.shader_dir;
+            if (dir.empty()) {
+                char buffer[1024] = {};
+                size_t length = 0;
+                if (getenv_s(&length, buffer, "LEONIDA_SHADERS") == 0 && length > 1) dir = buffer;
+            }
+            std::string error;
+            if (dir.empty())
+                std::fprintf(stderr, "[rt] d3d12: no translated shaders: set LEONIDA_SHADERS to <work>/shaders/spirv\n");
+            else if (!shader_library.load(dir, &error))
+                std::fprintf(stderr, "[rt] d3d12: %s\n", error.c_str());
+            else
+                std::fprintf(stderr, "[rt] d3d12: %zu translated shaders from %s\n", shader_library.size(), dir.c_str());
+        }
+        return shader_library.loaded() ? &shader_library : nullptr;
+    }
+
     bool depth_usable(VkFormat format) const {
         VkFormatProperties properties{};
         format_properties(info.physical, format, &properties);
@@ -119,12 +195,15 @@ struct DeviceState {
 
     // The first memory type with `required`, preferring one that also has `preferred`.
     VkDeviceMemory allocate(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags required,
-                            VkMemoryPropertyFlags preferred) const {
+                            VkMemoryPropertyFlags preferred, bool device_address = false) const {
+        VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         for (const VkMemoryPropertyFlags flags : {required | preferred, required}) {
             for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
                 if (!(requirements.memoryTypeBits & (1u << i))) continue;
                 if ((memory.memoryTypes[i].propertyFlags & flags) != flags) continue;
                 VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                if (device_address) allocate.pNext = &flags_info;
                 allocate.allocationSize = requirements.size;
                 allocate.memoryTypeIndex = i;
                 VkDeviceMemory out = VK_NULL_HANDLE;
@@ -142,22 +221,43 @@ public:
     // {4a7d2c90-5e1b-4f63-8c0a-91d3b6e2f417}
     static constexpr GUID kTag{0x4a7d2c90, 0x5e1b, 0x4f63, {0x8c, 0x0a, 0x91, 0xd3, 0xb6, 0xe2, 0xf4, 0x17}};
 
-    explicit DescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC& desc)
-        : desc_(desc), storage_(new std::byte[std::size_t(desc.NumDescriptors) * kDescriptorSize]()) {}
+    // A shader-visible heap lives in the GPU address arena: its CPU handles point at the arena's host mapping and
+    // its GPU handle is the console VA, so the bytes the game or Create*View writes are what shaders load. Other
+    // heaps (RTV, DSV, non-visible staging heaps) stay in host memory.
+    DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc) : device_(device), desc_(desc) {
+        const VkDeviceSize bytes = VkDeviceSize(desc.NumDescriptors) * kDescriptorSize;
+        if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped &&
+            device.arena_allocate(bytes, 256, arena_offset_)) {
+            in_arena_ = true;
+            cpu_ = device.arena.mapped + arena_offset_;
+            std::memset(cpu_, 0, std::size_t(bytes));
+        } else {
+            storage_.reset(new std::byte[std::size_t(bytes)]());
+            cpu_ = reinterpret_cast<std::uint8_t*>(storage_.get());
+        }
+    }
+
+    ~DescriptorHeap() override {
+        if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize);
+    }
 
     D3D12_DESCRIPTOR_HEAP_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
     D3D12_CPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE GetCPUDescriptorHandleForHeapStart() override {
-        return {reinterpret_cast<SIZE_T>(storage_.get())};
+        return {reinterpret_cast<SIZE_T>(cpu_)};
     }
-    // Shader-visible heaps get a GPU handle; descriptor tables that read it are not implemented yet.
     D3D12_GPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE GetGPUDescriptorHandleForHeapStart() override {
         if (!(desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return {0};
-        return {reinterpret_cast<UINT64>(storage_.get())};
+        if (!in_arena_) log_once("shader-visible heap without a GPU address arena; flags", int(desc_.Flags));
+        return {in_arena_ ? UINT64(arena_offset_) : 0};
     }
 
 private:
+    DeviceState& device_;
     D3D12_DESCRIPTOR_HEAP_DESC desc_;
     std::unique_ptr<std::byte[]> storage_;
+    std::uint8_t* cpu_ = nullptr;
+    VkDeviceSize arena_offset_ = 0;
+    bool in_arena_ = false;
 };
 
 class Resource final
@@ -174,6 +274,7 @@ public:
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         device_.context->remove_resource(id());
+        if (in_arena_) device_.arena_release(arena_offset_, desc_.Width);
         if (image_) vk.vkDestroyImage(dev, image_, nullptr);
         if (buffer_) vk.vkDestroyBuffer(dev, buffer_, nullptr);
         if (memory_) vk.vkFreeMemory(dev, memory_, nullptr);
@@ -182,24 +283,51 @@ public:
     leonida::ResourceId id() const { return resource_id(this); }
     VkImage image() const { return image_; }
 
+    // Default-heap buffers are ranges of the GPU address arena: console VA = offset, zeroed through the arena's host
+    // mapping. Upload and readback buffers keep their own host memory; with buffer device addresses their console
+    // VA is their device address minus heap_base, so a shader's heap_base + VA still lands on them (section 3.3).
     HRESULT create_buffer() {
         auto& vk = device_.context->vk;
+        const bool host = cpu_visible();
+        leonida::ResourceBinding binding{};  // a buffer: no image
+        binding.size = desc_.Width;
+        if (!host && device_.arena.mapped) {
+            if (!device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_)) {
+                log_once("GPU address arena full (raise LEONIDA_ARENA_MB); buffer size in KiB:",
+                         int(desc_.Width / 1024));
+                return E_OUTOFMEMORY;
+            }
+            in_arena_ = true;
+            std::memset(device_.arena.mapped + arena_offset_, 0, std::size_t(desc_.Width));
+            va_ = arena_offset_;
+            binding.buffer = device_.arena.buffer;
+            binding.buffer_offset = arena_offset_;
+            device_.context->add_resource(id(), binding);
+            return S_OK;
+        }
+        const bool addressable = device_.arena.buffer != VK_NULL_HANDLE;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = desc_.Width;
         info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+        if (addressable) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
-        const bool host = cpu_visible();
         memory_ = host ? device_.allocate(requirements,
                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                          heap_.Type == D3D12_HEAP_TYPE_READBACK ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0)
-                       : device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                                          heap_.Type == D3D12_HEAP_TYPE_READBACK ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0,
+                                          addressable)
+                       : device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, addressable);
         if (!memory_ || vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS)
             return E_OUTOFMEMORY;
+        if (addressable) {
+            VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            address.buffer = buffer_;
+            va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &address) - device_.arena.address;
+        }
         if (host) {
             if (vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &mapped_) != VK_SUCCESS)
                 return E_OUTOFMEMORY;
@@ -207,9 +335,7 @@ public:
         } else {
             log_once("default-heap buffers are not zero-filled yet; dimension", int(desc_.Dimension));
         }
-        leonida::ResourceBinding binding{};  // a buffer: no image
         binding.buffer = buffer_;
-        binding.size = desc_.Width;
         device_.context->add_resource(id(), binding);
         return S_OK;
     }
@@ -264,6 +390,9 @@ public:
 
     D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
 
+    // Buffers only, as on D3D12; textures have no GPU VA (images are reached through descriptors).
+    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return va_; }
+
     HRESULT STDMETHODCALLTYPE GetHeapProperties(D3D12_HEAP_PROPERTIES* properties, D3D12_HEAP_FLAGS* flags) override {
         if (properties) *properties = heap_;
         if (flags) *flags = heap_flags_;
@@ -293,6 +422,117 @@ private:
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     void* mapped_ = nullptr;
+    VkDeviceSize arena_offset_ = 0;
+    bool in_arena_ = false;
+    D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
+};
+
+class RootSignature final
+    : public Child<RootSignature, ID3D12RootSignatureStubs, ID3D12Object, ID3D12DeviceChild, ID3D12RootSignature> {
+public:
+    // {3e9b4a61-2d7c-4f18-b5a0-c71e8d92f036}
+    static constexpr GUID kTag{0x3e9b4a61, 0x2d7c, 0x4f18, {0xb5, 0xa0, 0xc7, 0x1e, 0x8d, 0x92, 0xf0, 0x36}};
+    explicit RootSignature(leonida::RootSignatureLayout layout) : layout_(std::move(layout)) {}
+    const leonida::RootSignatureLayout& layout() const { return layout_; }
+
+private:
+    leonida::RootSignatureLayout layout_;
+};
+
+// A pipeline state. Compute only for now: the shader is found by the SHA-256 of its FSSM program in the
+// translator's index, and the FSSM blob is copied into the arena as the shader's code base.
+class PipelineState final
+    : public Child<PipelineState, ID3D12PipelineStateStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
+                   ID3D12PipelineState> {
+public:
+    // {8d2f6c14-b0e7-4a93-9c58-1f4a7e3b6d20}
+    static constexpr GUID kTag{0x8d2f6c14, 0xb0e7, 0x4a93, {0x9c, 0x58, 0x1f, 0x4a, 0x7e, 0x3b, 0x6d, 0x20}};
+    explicit PipelineState(DeviceState& device) : device_(device) {}
+
+    ~PipelineState() override {
+        auto& vk = device_.context->vk;
+        const VkDevice dev = device_.info.device;
+        if (registered_) device_.context->remove_pipeline(id());
+        if (pipeline_.pipeline) vk.vkDestroyPipeline(dev, pipeline_.pipeline, nullptr);
+        if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
+        if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
+        if (code_bytes_) device_.arena_release(pipeline_.code_base, code_bytes_);
+    }
+
+    std::uintptr_t id() const { return reinterpret_cast<std::uintptr_t>(static_cast<const ID3D12PipelineState*>(this)); }
+    bool compute() const { return registered_; }
+
+    HRESULT create_compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc) {
+        auto& vk = device_.context->vk;
+        const VkDevice dev = device_.info.device;
+        if (!desc.CS.pShaderBytecode || !desc.CS.BytecodeLength) return E_INVALIDARG;
+        if (!device_.arena.mapped) {
+            log_once("pipelines need the GPU address arena (bufferDeviceAddress); stage", 0);
+            return E_NOTIMPL;
+        }
+        const std::vector<std::uint8_t> fssm = leonida::fssm_program(
+            {static_cast<const std::uint8_t*>(desc.CS.pShaderBytecode), desc.CS.BytecodeLength});
+        if (fssm.empty()) {
+            log_once("compute shader bytecode holds no FSSM program; bytes", int(desc.CS.BytecodeLength));
+            return E_INVALIDARG;
+        }
+        const leonida::ShaderLibrary* library = device_.library();
+        if (!library) return E_FAIL;
+        const std::string hash = leonida::sha256_hex(fssm);
+        const leonida::ShaderEntry* entry = library->find("cs", hash);
+        if (!entry) {
+            std::fprintf(stderr, "[rt] d3d12: no translated compute shader for FSSM sha256 %s\n", hash.c_str());
+            return E_INVALIDARG;
+        }
+        if (entry->binding_count) {
+            // Set 0 (bindless images, samplers, the descriptor hash table) is milestone M2.
+            std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the bindless set is not implemented yet\n",
+                         entry->name.c_str());
+            return E_NOTIMPL;
+        }
+        if (entry->wave64) log_once("wave64 compute shader runs 32-wide (subgroup size control not requested yet)", 0);
+        const std::vector<std::uint32_t> words = library->spirv(*entry);
+        if (words.empty()) {
+            std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
+            return E_FAIL;
+        }
+
+        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        module_info.codeSize = words.size() * 4;
+        module_info.pCode = words.data();
+        if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return E_FAIL;
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
+        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout_info.pushConstantRangeCount = 1;
+        layout_info.pPushConstantRanges = &push;
+        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
+        VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline_info.stage.module = module_;
+        pipeline_info.stage.pName = "main";
+        pipeline_info.layout = pipeline_.layout;
+        if (vk.vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
+            VK_SUCCESS)
+            return E_FAIL;
+
+        // The code base: shaders read constant tables embedded in their own program through s_getpc_b64.
+        VkDeviceSize offset = 0;
+        if (!device_.arena_allocate(fssm.size(), 256, offset)) return E_OUTOFMEMORY;
+        std::memcpy(device_.arena.mapped + offset, fssm.data(), fssm.size());
+        code_bytes_ = fssm.size();
+        pipeline_.code_base = offset;
+        device_.context->add_pipeline(id(), pipeline_);
+        registered_ = true;
+        return S_OK;
+    }
+
+private:
+    DeviceState& device_;
+    leonida::ComputePipeline pipeline_;
+    VkShaderModule module_ = VK_NULL_HANDLE;
+    VkDeviceSize code_bytes_ = 0;
+    bool registered_ = false;
 };
 
 // The Vulkan objects create_vulkan_device_standalone made, destroyed with the device.
@@ -323,6 +563,45 @@ public:
         memory_properties(info.physical, &state_.memory);
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
                                                                   info.separate_depth_stencil_layouts);
+        if (info.buffer_device_address && state_.context->loaded() && !create_arena())
+            std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
+    }
+
+    // LEONIDA_ARENA_MB sets its size (default 256, at most 4095): it holds every default-heap buffer, shader-
+    // visible descriptor heap and shader program. M0-M3 keep it host-visible (section 3.3, memory type policy).
+    bool create_arena() {
+        auto& vk = state_.context->vk;
+        if (!vk.vkGetBufferDeviceAddress) return false;
+        VkDeviceSize megabytes = 256;
+        char text[16] = {};
+        size_t length = 0;
+        if (getenv_s(&length, text, "LEONIDA_ARENA_MB") == 0 && length > 1)
+            megabytes = std::clamp<VkDeviceSize>(std::strtoull(text, nullptr, 10), 16, 4095);
+        auto& arena = state_.arena;
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = megabytes << 20;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        if (vk.vkCreateBuffer(state_.info.device, &info, nullptr, &arena.buffer) != VK_SUCCESS) return false;
+        VkMemoryRequirements requirements{};
+        vk.vkGetBufferMemoryRequirements(state_.info.device, arena.buffer, &requirements);
+        arena.memory = state_.allocate(requirements,
+                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
+        void* mapped = nullptr;
+        if (!arena.memory || vk.vkBindBufferMemory(state_.info.device, arena.buffer, arena.memory, 0) != VK_SUCCESS ||
+            vk.vkMapMemory(state_.info.device, arena.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS)
+            return false;
+        arena.mapped = static_cast<std::uint8_t*>(mapped);
+        VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        address.buffer = arena.buffer;
+        arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
+        arena.size = info.size;
+        arena.free[64 * 1024] = arena.size - 64 * 1024;
+        state_.context->set_heap_base(arena.address);
+        return true;
     }
 
     ~Device() override {
@@ -330,12 +609,19 @@ public:
             std::lock_guard lock(state_.context->submit_mutex());
             state_.context->vk.vkDeviceWaitIdle(state_.info.device);
         }
+        if (state_.context && state_.arena.buffer) {
+            auto& vk = state_.context->vk;
+            vk.vkDestroyBuffer(state_.info.device, state_.arena.buffer, nullptr);
+            if (state_.arena.memory) vk.vkFreeMemory(state_.info.device, state_.arena.memory, nullptr);
+        }
         state_.context.reset();
         if (owned_.device) owned_.destroy_device(owned_.device, nullptr);
         if (owned_.instance) owned_.destroy_instance(owned_.instance, nullptr);
     }
 
     bool ok() const { return state_.context && state_.context->loaded(); }
+    const DeviceState& state() const { return state_; }
+    IUnknown* holder() { return identity(); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
     void set_outer(IUnknown* outer) { outer_ = outer; }
 
@@ -388,9 +674,42 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (!desc || !desc->NumDescriptors) return E_INVALIDARG;
-        auto* heap = new DescriptorHeap(*desc);
+        auto* heap = new DescriptorHeap(state_, *desc);
         heap->attach_device(identity());
         return hand_out(heap, riid, out);
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateRootSignature(UINT, const void* blob, SIZE_T size, REFIID riid,
+                                                  void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!blob || !size) return E_INVALIDARG;
+        leonida::RootSignatureLayout layout;
+        if (!leonida::parse_root_signature({static_cast<const std::uint8_t*>(blob), size}, layout)) {
+            log_once("root signature blob not understood; bytes", int(size));
+            return E_INVALIDARG;
+        }
+        if (!layout.fits())  // the console spills the rest to memory; its layout is still open (section 3.5)
+            log_once("root signature needs more than 32 user-data dwords; the spill is not modelled:",
+                     int(layout.user_dwords));
+        auto* signature = new RootSignature(std::move(layout));
+        signature->attach_device(identity());
+        return hand_out(signature, riid, out);
+    }
+
+    // PC slot 11; the Xbox ABI reaches it through device slot 62 (the proxy forwards).
+    HRESULT STDMETHODCALLTYPE CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid,
+                                                         void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!desc) return E_INVALIDARG;
+        auto* pipeline = new PipelineState(state_);
+        pipeline->attach_device(identity());
+        if (const HRESULT hr = pipeline->create_compute(*desc); FAILED(hr)) {
+            pipeline->Release();
+            return hr;
+        }
+        return hand_out(pipeline, riid, out);
     }
 
     UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE) override {
@@ -608,9 +927,66 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer) {
     if (Device* d = Device::from<Device>(device)) d->set_outer(outer);
 }
 
+const leonida::RootSignatureLayout* root_signature_layout(ID3D12RootSignature* signature) {
+    const RootSignature* s = RootSignature::from<RootSignature>(signature);
+    return s ? &s->layout() : nullptr;
+}
+
+std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    return p && p->compute() ? p->id() : 0;
+}
+
 VkImage vulkan_image(ID3D12Resource* resource) {
     const Resource* r = Resource::from<Resource>(resource);
     return r ? r->image() : VK_NULL_HANDLE;
+}
+
+WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)
+    : device_(device), presenter_(std::move(presenter)) {
+    device_->AddRef();
+}
+
+WindowPresenter::~WindowPresenter() {
+    presenter_.reset();  // before the device it runs on
+    device_->Release();
+}
+
+HRESULT WindowPresenter::present(ID3D12Resource* back_buffer, UINT sync_interval) {
+    if (!back_buffer) return E_INVALIDARG;
+    const VkResult result = presenter_->present(resource_id(back_buffer), sync_interval > 0);
+    if (result == VK_SUCCESS) return S_OK;
+    std::fprintf(stderr, "[rt] d3d12: present failed (VkResult %d)\n", int(result));
+    return result == VK_ERROR_DEVICE_LOST ? DXGI_ERROR_DEVICE_REMOVED : E_FAIL;
+}
+
+VkExtent2D WindowPresenter::extent() const { return presenter_->extent(); }
+std::uint64_t WindowPresenter::presented() const { return presenter_->presented(); }
+
+std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window) {
+    Device* d = Device::from<Device>(device);
+    if (!d || !window) return nullptr;
+    const VulkanDeviceInfo& info = d->state().info;
+    if (!info.presentation) {
+        std::fprintf(stderr, "[rt] d3d12: the Vulkan device was created without presentation support\n");
+        return nullptr;
+    }
+    const auto create_surface = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(
+        info.get_instance_proc(info.instance, "vkCreateWin32SurfaceKHR"));
+    if (!create_surface) return nullptr;
+    VkWin32SurfaceCreateInfoKHR surface_info{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+    surface_info.hinstance = GetModuleHandleW(nullptr);
+    surface_info.hwnd = window;
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    if (create_surface(info.instance, &surface_info, nullptr, &surface) != VK_SUCCESS) return nullptr;
+    auto presenter = std::make_unique<leonida::VulkanPresenter>(*d->state().context, info.get_instance_proc,
+                                                                info.instance, info.physical, info.queue,
+                                                                info.queue_family, surface);  // owns the surface
+    if (!presenter->ok()) {
+        std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
+        return nullptr;
+    }
+    return std::make_unique<WindowPresenter>(d->holder(), std::move(presenter));
 }
 
 // Creates its own Vulkan 1.3 instance and device. LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
@@ -626,11 +1002,28 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         return E_FAIL;
     }
     const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(get(nullptr, "vkCreateInstance"));
+    const auto instance_extensions = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+        get(nullptr, "vkEnumerateInstanceExtensionProperties"));
+    std::uint32_t extension_count = 0;
+    instance_extensions(nullptr, &extension_count, nullptr);
+    std::vector<VkExtensionProperties> available(extension_count);
+    instance_extensions(nullptr, &extension_count, available.data());
+    const auto has = [](const std::vector<VkExtensionProperties>& list, const char* name) {
+        for (const auto& e : list)
+            if (std::strcmp(e.extensionName, name) == 0) return true;
+        return false;
+    };
+    const char* surface_extensions[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+    const bool surfaces = has(available, surface_extensions[0]) && has(available, surface_extensions[1]);
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "gta6rt";
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instance_info.pApplicationInfo = &app;
+    if (surfaces) {
+        instance_info.enabledExtensionCount = 2;
+        instance_info.ppEnabledExtensionNames = surface_extensions;
+    }
     const char* layer = "VK_LAYER_KHRONOS_validation";
     char validation[8] = {};
     size_t length = 0;
@@ -657,6 +1050,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     LEONIDA_INSTANCE(vkGetPhysicalDeviceFeatures2);
     LEONIDA_INSTANCE(vkCreateDevice);
     LEONIDA_INSTANCE(vkGetDeviceProcAddr);
+    LEONIDA_INSTANCE(vkEnumerateDeviceExtensionProperties);
 #undef LEONIDA_INSTANCE
     std::uint32_t count = 0;
     vkEnumeratePhysicalDevices(owned.instance, &count, nullptr);
@@ -678,7 +1072,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         vkGetPhysicalDeviceFeatures2(candidate, &features);
         const bool bc = features.features.textureCompressionBC;
         if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore ||
-            !f12.separateDepthStencilLayouts)
+            !f12.separateDepthStencilLayouts || !f12.bufferDeviceAddress)
             continue;
         std::uint32_t family_count = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(candidate, &family_count, nullptr);
@@ -705,6 +1099,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
     enable12.timelineSemaphore = VK_TRUE;
     enable12.separateDepthStencilLayouts = VK_TRUE;
+    enable12.bufferDeviceAddress = VK_TRUE;
+    info.buffer_device_address = true;
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queue_info.queueFamilyIndex = info.queue_family;
@@ -717,6 +1113,15 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
     device_info.pEnabledFeatures = &enable;
+    vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
+    std::vector<VkExtensionProperties> device_extensions(extension_count);
+    vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, device_extensions.data());
+    const char* swapchain = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    info.presentation = surfaces && has(device_extensions, swapchain);
+    if (info.presentation) {
+        device_info.enabledExtensionCount = 1;
+        device_info.ppEnabledExtensionNames = &swapchain;
+    }
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
         return fail("vkCreateDevice failed");
     info.device = owned.device;

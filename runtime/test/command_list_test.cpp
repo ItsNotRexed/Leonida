@@ -126,6 +126,21 @@ int main() {
     CHECK(std::get<CopyTexture>(list.commands()[2]).box.right == 6);
     CHECK(std::get<CopyResource>(list.commands()[3]).src == 6);
 
+    // Dispatches keep the user data they were recorded with; no pipeline is refused, no groups records nothing.
+    CHECK(list.reset());
+    Dispatch dispatch{0x1234, {}, 2, 1, 1};
+    dispatch.user_data[0] = 7;
+    dispatch.user_data[31] = 9;
+    CHECK(list.dispatch(dispatch));
+    dispatch.user_data[0] = 8;  // the caller's block changes after recording
+    CHECK(!list.dispatch({0, {}, 1, 1, 1}));
+    CHECK(list.dispatch({0x1234, {}, 0, 1, 1}));
+    CHECK(list.close());
+    CHECK(!list.dispatch(dispatch));
+    CHECK(list.commands().size() == 1);
+    const auto& recorded = std::get<Dispatch>(list.commands()[0]);
+    CHECK(recorded.pipeline == 0x1234 && recorded.user_data[0] == 7 && recorded.user_data[31] == 9 && recorded.x == 2);
+
     CHECK(list.reset());
     CHECK(!list.closed() && list.commands().empty());
     CHECK(!list.reset());
