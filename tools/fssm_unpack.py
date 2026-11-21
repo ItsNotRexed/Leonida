@@ -83,6 +83,10 @@ def main() -> int:
         rows.append({"name": stem, "size": len(fssm), "magic": fssm[:4].decode("latin-1"),
                      "version": struct.unpack_from("<H", fssm, 4)[0], "endpgm": ends,
                      "tags": sorted(hex(t) for t in ents)})
+    if not rows:   # no index either: make_game.py takes fssm_index.json as "unpacking done"
+        print(f"ERROR: no FSSM blob unpacked from the .dxbc files in {src}, problems: "
+              f"{dict(problems)}. Is this the right game folder and version?", file=sys.stderr)
+        return 1
     with open(os.path.join(src, "fssm_index.json"), "w", encoding="utf-8") as f:
         json.dump(rows, f)
     print(f"{len(rows)} FSSM blobs, problems: {dict(problems)}")

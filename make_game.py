@@ -280,7 +280,9 @@ def shaders(game: str, work: str, jobs: int) -> None:
     if not os.path.isfile(os.path.join(dxbc, "index.json")):
         log("shaders: carving shaders.rpf")
         py("shader_carve.py", src, dxbc)
-    if not os.path.isdir(os.path.join(dxbc, "fssm")):
+    # Each step counts as done only by what it writes last (fssm_unpack.py: fssm_index.json; disassembly: the
+    # disasm.done marker below; rdna2spirv.py --merge: spirv/index.json), so a stopped step is run again.
+    if not os.path.isfile(os.path.join(dxbc, "fssm_index.json")):
         log("shaders: unpacking native code")
         py("fssm_unpack.py", dxbc)
     # rdna2spirv.py finds index.json, the .dxbc files and fssm/ in the parent of the .s files' folder, so the
@@ -291,13 +293,24 @@ def shaders(game: str, work: str, jobs: int) -> None:
         log("shaders: moving disasm into the carve folder and translating again")
         os.rename(old, disasm)
         shutil.rmtree(os.path.join(sh, "spirv"), ignore_errors=True)
-    if not os.path.isdir(disasm) or len(os.listdir(disasm)) < 1000:
+    spirv = os.path.join(sh, "spirv")
+    done = os.path.join(dxbc, "disasm.done")
+    if not os.path.isfile(done) and os.path.isdir(disasm):
+        # A build from before the marker: complete if there is a .s for every .fssm.
+        fssm = os.path.join(dxbc, "fssm")
+        want = sum(f.endswith(".fssm") for f in os.listdir(fssm))
+        if want and sum(f.endswith(".s") for f in os.listdir(disasm)) >= want:
+            open(done, "w").close()
+    if not os.path.isfile(done):
         need(os.environ.get("LLVM_MC", "llvm-mc"),
              "Install LLVM 21 or newer with the AMDGPU target, or set LLVM_MC to llvm-mc's full path.")
         log("shaders: disassembling (gfx1013)")
+        idx = os.path.join(spirv, "index.json")   # a translation of an earlier disassembly is out of date
+        if os.path.isfile(idx):
+            os.remove(idx)
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
-    spirv = os.path.join(sh, "spirv")
-    if not os.path.isdir(spirv) or len(os.listdir(spirv)) < 1000:
+        open(done, "w").close()
+    if not os.path.isfile(os.path.join(spirv, "index.json")):
         need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
         need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
         log(f"shaders: translating RDNA2 to SPIR-V on {jobs} processes (the longest step)")

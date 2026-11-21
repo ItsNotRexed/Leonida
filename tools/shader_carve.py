@@ -21,6 +21,22 @@ import zlib
 
 ENTRY = re.compile(rb"([\x21-\x7e]{3,200})\x00(.)(....)(....)\3(....)", re.DOTALL)
 STAGES = {0: "ps", 1: "vs", 2: "gs", 3: "hs", 4: "ds", 5: "cs", 6: "lib", 13: "ms", 14: "as"}
+# Windows device names: "NUL.dxbc" or "con.x.dxbc" can't be created as files, whatever the extension.
+RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+def file_stem(name: str, seen: dict) -> str:
+    """A file name for `name` that no earlier one in `seen` maps to, on a case-insensitive file system too."""
+    stem = re.sub(r'[<>:"/\\|?*]', "_", name)
+    if stem.split(".")[0].rstrip(" ").upper() in RESERVED:
+        stem = "_" + stem
+    base, n = stem, seen.get(stem.lower(), 0)
+    while stem.lower() in seen:            # "a<b" and "a>b" both become "a_b"; "Foo" and "foo" are one file
+        n += 1
+        stem = f"{base}~{n}"
+    seen[base.lower()] = n
+    seen[stem.lower()] = 0
+    return stem
 
 
 def parts(dxbc: bytes) -> dict:
@@ -64,9 +80,7 @@ def main() -> int:
             p = parts(data)
             stage, sm = shader_model(data, p)
             # Same name twice means distinct variants; keep both.
-            n = seen.get(name, 0)
-            seen[name] = n + 1
-            fname = re.sub(r'[<>:"/\\|?*]', "_", name) + (f"~{n}" if n else "") + ".dxbc"
+            fname = file_stem(name, seen) + ".dxbc"
             with open(os.path.join(out, fname), "wb") as f:
                 f.write(data)
             index.append({"name": name, "file": fname, "offset": mt.start(), "kind": mt.group(2)[0],

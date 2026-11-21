@@ -443,5 +443,32 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
 
 
+class FileStemTest(unittest.TestCase):
+    """Names that would land on one file on NTFS, or can't be created at all, must get distinct, valid stems."""
+
+    def stems(self, names):
+        seen = {}
+        return [shader_carve.file_stem(n, seen) for n in names]
+
+    def test_exact_repeats_keep_tilde_numbering(self):
+        self.assertEqual(self.stems(["ps_main"] * 3), ["ps_main", "ps_main~1", "ps_main~2"])
+
+    def test_case_variants_get_distinct_stems(self):
+        out = self.stems(["Foo", "foo", "FOO", "Foo"])
+        self.assertEqual(out, ["Foo", "foo~1", "FOO~2", "Foo~3"])
+        self.assertEqual(len({s.lower() for s in out}), len(out))
+
+    def test_names_equal_after_sanitizing_get_distinct_stems(self):
+        self.assertEqual(self.stems(["a<b", "a>b", "a_b"]), ["a_b", "a_b~1", "a_b~2"])
+
+    def test_tilde_name_does_not_collide_with_a_variant(self):
+        out = self.stems(["foo", "foo", "foo~1"])
+        self.assertEqual(len({s.lower() for s in out}), 3)
+
+    def test_windows_device_names_are_prefixed(self):
+        self.assertEqual(self.stems(["NUL", "con.x", "com1", "LPT9"]), ["_NUL", "_con.x", "_com1", "_LPT9"])
+        self.assertEqual(self.stems(["COM10", "console", "nul_ps"]), ["COM10", "console", "nul_ps"])
+
+
 if __name__ == "__main__":
     unittest.main()

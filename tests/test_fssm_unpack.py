@@ -298,6 +298,16 @@ class TestMainDirectoryProcessing(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_nothing_unpacked_fails_without_index(self):
+        # make_game.py takes fssm_index.json as "unpacking done", so an empty run must not write it.
+        with open(os.path.join(self.src, "no_xbch.dxbc"), "wb") as f:
+            f.write(make_dxbc([(b"DXIL", b"\x00" * 16)]))
+        res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("no FSSM blob unpacked", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.src, "fssm_index.json")))
+
     def test_main_cli_processing_and_index_generation(self):
         fssm_1 = make_fssm(version=0x0101, instructions=[(0x40, S_ENDPGM)])
         fssm_2 = make_fssm(version=0x0102, instructions=[(0x20, S_ENDPGM), (0x60, S_ENDPGM)])
