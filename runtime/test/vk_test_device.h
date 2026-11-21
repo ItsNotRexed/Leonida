@@ -80,7 +80,8 @@ public:
 
     unsigned validation_errors() const { return validation_error_count(); }
 
-    bool create() {
+    // presentation: also enable VK_KHR_surface + VK_KHR_win32_surface and VK_KHR_swapchain (Windows only).
+    bool create(bool presentation = false) {
         instance_proc = load_vulkan();
         if (!instance_proc) return false;
         const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(instance_proc(nullptr, "vkCreateInstance"));
@@ -110,6 +111,11 @@ public:
         app.apiVersion = VK_API_VERSION_1_3;
         VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         instance_info.pApplicationInfo = &app;
+        std::vector<const char*> extensions;
+        if (presentation) {
+            extensions.push_back("VK_KHR_surface");
+            extensions.push_back("VK_KHR_win32_surface");
+        }
         if (validation) {
             std::uint32_t count = 0;
             enumerate_layers(&count, nullptr);
@@ -124,9 +130,10 @@ public:
             instance_info.pNext = &messenger_info;
             instance_info.enabledLayerCount = 1;
             instance_info.ppEnabledLayerNames = &layer;
-            instance_info.enabledExtensionCount = 1;
-            instance_info.ppEnabledExtensionNames = &debug_utils;
+            extensions.push_back(debug_utils);
         }
+        instance_info.enabledExtensionCount = std::uint32_t(extensions.size());
+        instance_info.ppEnabledExtensionNames = extensions.data();
         if (create_instance(&instance_info, nullptr, &instance) != VK_SUCCESS) return false;
         if (validation &&
             instance_fn<PFN_vkCreateDebugUtilsMessengerEXT>("vkCreateDebugUtilsMessengerEXT")(
@@ -195,6 +202,11 @@ public:
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
         device_info.pEnabledFeatures = &enable;
+        const char* swapchain = "VK_KHR_swapchain";
+        if (presentation) {
+            device_info.enabledExtensionCount = 1;
+            device_info.ppEnabledExtensionNames = &swapchain;
+        }
         if (instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device) != VK_SUCCESS)
             return false;
         device_proc = instance_fn<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");

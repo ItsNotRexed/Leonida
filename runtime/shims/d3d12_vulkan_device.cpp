@@ -6,6 +6,9 @@
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
+#include "../src/vulkan_present.h"
+
+#include <vulkan/vulkan_win32.h>
 
 #include <algorithm>
 #include <atomic>
@@ -336,6 +339,8 @@ public:
     }
 
     bool ok() const { return state_.context && state_.context->loaded(); }
+    const DeviceState& state() const { return state_; }
+    IUnknown* holder() { return identity(); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
     void set_outer(IUnknown* outer) { outer_ = outer; }
 
@@ -613,6 +618,53 @@ VkImage vulkan_image(ID3D12Resource* resource) {
     return r ? r->image() : VK_NULL_HANDLE;
 }
 
+WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)
+    : device_(device), presenter_(std::move(presenter)) {
+    device_->AddRef();
+}
+
+WindowPresenter::~WindowPresenter() {
+    presenter_.reset();  // before the device it runs on
+    device_->Release();
+}
+
+HRESULT WindowPresenter::present(ID3D12Resource* back_buffer, UINT sync_interval) {
+    if (!back_buffer) return E_INVALIDARG;
+    const VkResult result = presenter_->present(resource_id(back_buffer), sync_interval > 0);
+    if (result == VK_SUCCESS) return S_OK;
+    std::fprintf(stderr, "[rt] d3d12: present failed (VkResult %d)\n", int(result));
+    return result == VK_ERROR_DEVICE_LOST ? DXGI_ERROR_DEVICE_REMOVED : E_FAIL;
+}
+
+VkExtent2D WindowPresenter::extent() const { return presenter_->extent(); }
+std::uint64_t WindowPresenter::presented() const { return presenter_->presented(); }
+
+std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window) {
+    Device* d = Device::from<Device>(device);
+    if (!d || !window) return nullptr;
+    const VulkanDeviceInfo& info = d->state().info;
+    if (!info.presentation) {
+        std::fprintf(stderr, "[rt] d3d12: the Vulkan device was created without presentation support\n");
+        return nullptr;
+    }
+    const auto create_surface = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(
+        info.get_instance_proc(info.instance, "vkCreateWin32SurfaceKHR"));
+    if (!create_surface) return nullptr;
+    VkWin32SurfaceCreateInfoKHR surface_info{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+    surface_info.hinstance = GetModuleHandleW(nullptr);
+    surface_info.hwnd = window;
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    if (create_surface(info.instance, &surface_info, nullptr, &surface) != VK_SUCCESS) return nullptr;
+    auto presenter = std::make_unique<leonida::VulkanPresenter>(*d->state().context, info.get_instance_proc,
+                                                                info.instance, info.physical, info.queue,
+                                                                info.queue_family, surface);  // owns the surface
+    if (!presenter->ok()) {
+        std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
+        return nullptr;
+    }
+    return std::make_unique<WindowPresenter>(d->holder(), std::move(presenter));
+}
+
 // Creates its own Vulkan 1.3 instance and device. LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (!out) return E_POINTER;
@@ -626,11 +678,28 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         return E_FAIL;
     }
     const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(get(nullptr, "vkCreateInstance"));
+    const auto instance_extensions = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+        get(nullptr, "vkEnumerateInstanceExtensionProperties"));
+    std::uint32_t extension_count = 0;
+    instance_extensions(nullptr, &extension_count, nullptr);
+    std::vector<VkExtensionProperties> available(extension_count);
+    instance_extensions(nullptr, &extension_count, available.data());
+    const auto has = [](const std::vector<VkExtensionProperties>& list, const char* name) {
+        for (const auto& e : list)
+            if (std::strcmp(e.extensionName, name) == 0) return true;
+        return false;
+    };
+    const char* surface_extensions[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+    const bool surfaces = has(available, surface_extensions[0]) && has(available, surface_extensions[1]);
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "gta6rt";
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instance_info.pApplicationInfo = &app;
+    if (surfaces) {
+        instance_info.enabledExtensionCount = 2;
+        instance_info.ppEnabledExtensionNames = surface_extensions;
+    }
     const char* layer = "VK_LAYER_KHRONOS_validation";
     char validation[8] = {};
     size_t length = 0;
@@ -657,6 +726,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     LEONIDA_INSTANCE(vkGetPhysicalDeviceFeatures2);
     LEONIDA_INSTANCE(vkCreateDevice);
     LEONIDA_INSTANCE(vkGetDeviceProcAddr);
+    LEONIDA_INSTANCE(vkEnumerateDeviceExtensionProperties);
 #undef LEONIDA_INSTANCE
     std::uint32_t count = 0;
     vkEnumeratePhysicalDevices(owned.instance, &count, nullptr);
@@ -717,6 +787,15 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
     device_info.pEnabledFeatures = &enable;
+    vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
+    std::vector<VkExtensionProperties> device_extensions(extension_count);
+    vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, device_extensions.data());
+    const char* swapchain = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    info.presentation = surfaces && has(device_extensions, swapchain);
+    if (info.presentation) {
+        device_info.enabledExtensionCount = 1;
+        device_info.ppEnabledExtensionNames = &swapchain;
+    }
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
         return fail("vkCreateDevice failed");
     info.device = owned.device;

@@ -127,6 +127,7 @@ public:
 
 private:
     friend class VulkanQueue;
+    friend class VulkanPresenter;
 
     const ResourceBinding* resolve(ResourceId id) const {
         const auto it = resources_.find(id);
