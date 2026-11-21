@@ -49,6 +49,7 @@ struct ResourceBinding {
     bool simultaneous_access = false;  // D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS: always GENERAL
     bool not_zeroed = false;           // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED: first use skips the zero fill
     VkBuffer buffer = VK_NULL_HANDLE;  // a buffer resource, for copies
+    VkDeviceSize buffer_offset = 0;    // where it starts in `buffer` (the GPU address arena holds many)
     VkDeviceSize size = 0;             // its size in bytes
 };
 
@@ -451,6 +452,22 @@ private:
     std::unordered_map<ResourceId, Entry> entries_;
 };
 
+// A compute pipeline as replay needs it. code_base is the console VA of the shader's FSSM blob (push-constant
+// dwords 34-35), 0 when the shader does not read it.
+struct ComputePipeline {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    std::uint64_t code_base = 0;
+};
+
+// The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
+struct ShaderUserData {
+    std::uint32_t s[32];
+    std::uint64_t heap_base;
+    std::uint64_t code_base;
+};
+static_assert(sizeof(ShaderUserData) == 144);
+
 struct ReplayFunctions {
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
     PFN_vkCmdClearColorImage clear_color_image = nullptr;
@@ -464,6 +481,11 @@ struct ReplayFunctions {
     PFN_vkCmdCopyBufferToImage copy_buffer_to_image = nullptr;
     PFN_vkCmdCopyImageToBuffer copy_image_to_buffer = nullptr;
     PFN_vkCmdCopyImage copy_image = nullptr;
+    PFN_vkCmdBindPipeline bind_pipeline = nullptr;              // dispatches
+    PFN_vkCmdPushConstants push_constants = nullptr;
+    PFN_vkCmdDispatch dispatch = nullptr;
+    std::function<const ComputePipeline*(std::uintptr_t)> compute_pipeline;
+    std::uint64_t heap_base = 0;  // device address of the GPU address arena (push-constant dwords 32-33)
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
@@ -492,6 +514,7 @@ struct Prepared {
     std::vector<VkBufferCopy> buffer_copies;
     std::vector<VkBufferImageCopy> buffer_image_copies;  // one direction, given by which side is an image
     std::vector<VkImageCopy> image_copies;
+    ComputePipeline pipeline;  // dispatches
 };
 
 inline bool view_range(const ResourceBinding& resource, const TargetView& view, VkImageAspectFlags aspects,
@@ -663,7 +686,7 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     const std::uint64_t row_bytes = std::uint64_t((w + format.block - 1) / format.block) * format.bytes;
     if (!within(offset, (rows - 1) * placed.row_pitch + row_bytes, buffer.size)) return ReplayResult::invalid_copy;
     VkBufferImageCopy region{};
-    region.bufferOffset = offset;
+    region.bufferOffset = buffer.buffer_offset + offset;
     region.bufferRowLength = placed.row_pitch / format.bytes * format.block;
     region.imageSubresource = {range.aspectMask, range.baseMipLevel, range.baseArrayLayer, 1};
     region.imageOffset = {std::int32_t(texture_x), std::int32_t(texture_y), 0};
@@ -677,7 +700,7 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
 inline ReplayResult prepare_resource_copy(Prepared& p) {
     if (p.binding.buffer && p.source.buffer) {
         if (p.binding.size != p.source.size) return ReplayResult::invalid_copy;
-        p.buffer_copies.push_back({0, 0, p.source.size});
+        p.buffer_copies.push_back({p.source.buffer_offset, p.binding.buffer_offset, p.source.size});
         return ReplayResult::success;
     }
     const ResourceBinding &dst = p.binding, &src = p.source;
@@ -842,13 +865,20 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     !detail::within(buffer_copy->dst_offset, buffer_copy->size, p.binding.size) ||
                     !detail::within(buffer_copy->src_offset, buffer_copy->size, p.source.size))
                     return ReplayResult::invalid_copy;
-                p.buffer_copies.push_back({buffer_copy->src_offset, buffer_copy->dst_offset, buffer_copy->size});
+                p.buffer_copies.push_back({p.source.buffer_offset + buffer_copy->src_offset,
+                                           p.binding.buffer_offset + buffer_copy->dst_offset, buffer_copy->size});
             } else if (const auto* texture_copy = std::get_if<CopyTexture>(&command)) {
                 result = detail::prepare_texture_copy(*texture_copy, p);
             } else {
                 result = detail::prepare_resource_copy(p);
             }
             if (result != ReplayResult::success) return result;
+        } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
+            if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
+                return ReplayResult::unsupported;
+            const ComputePipeline* pipeline = vk.compute_pipeline(dispatch->pipeline);
+            if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+            p.pipeline = *pipeline;
         }
     }
     return ReplayResult::success;
@@ -1048,6 +1078,14 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.binding.buffer,
                                         std::uint32_t(p.buffer_image_copies.size()), p.buffer_image_copies.data());
             }
+        } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
+            ShaderUserData data{};
+            std::copy(dispatch->user_data.begin(), dispatch->user_data.end(), data.s);
+            data.heap_base = vk.heap_base;
+            data.code_base = p.pipeline.code_base;
+            vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
+            vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
+            vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
         }
     }
 }

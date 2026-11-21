@@ -31,7 +31,10 @@ struct VulkanDeviceFunctions {
     X(vkCmdClearAttachments) X(vkDeviceWaitIdle) X(vkCreateImage) X(vkDestroyImage)                         \
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
-    X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)
+    X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage) \
+    X(vkCmdBindPipeline) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCreateShaderModule) X(vkDestroyShaderModule)   \
+    X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateComputePipelines) X(vkDestroyPipeline)          \
+    X(vkGetBufferDeviceAddress)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -49,7 +52,9 @@ struct VulkanDeviceFunctions {
                vkDestroyImage && vkGetImageMemoryRequirements && vkBindImageMemory && vkCreateBuffer &&
                vkDestroyBuffer && vkGetBufferMemoryRequirements && vkBindBufferMemory && vkAllocateMemory &&
                vkFreeMemory && vkMapMemory && vkUnmapMemory && vkCmdCopyBuffer && vkCmdCopyBufferToImage &&
-               vkCmdCopyImageToBuffer && vkCmdCopyImage;
+               vkCmdCopyImageToBuffer && vkCmdCopyImage && vkCmdBindPipeline && vkCmdPushConstants &&
+               vkCmdDispatch && vkCreateShaderModule && vkDestroyShaderModule && vkCreatePipelineLayout &&
+               vkDestroyPipelineLayout && vkCreateComputePipelines && vkDestroyPipeline;
     }
 };
 
@@ -70,6 +75,13 @@ public:
         replay_.copy_buffer_to_image = vk.vkCmdCopyBufferToImage;
         replay_.copy_image_to_buffer = vk.vkCmdCopyImageToBuffer;
         replay_.copy_image = vk.vkCmdCopyImage;
+        replay_.bind_pipeline = vk.vkCmdBindPipeline;
+        replay_.push_constants = vk.vkCmdPushConstants;
+        replay_.dispatch = vk.vkCmdDispatch;
+        replay_.compute_pipeline = [this](std::uintptr_t id) -> const ComputePipeline* {
+            const auto it = pipelines_.find(id);
+            return it == pipelines_.end() ? nullptr : &it->second;
+        };
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             return view(r, range);
         };
@@ -114,6 +126,26 @@ public:
         resources_.erase(it);
     }
 
+    // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
+    void set_heap_base(std::uint64_t heap_base) {
+        std::lock_guard lock(mutex_);
+        replay_.heap_base = heap_base;
+    }
+    std::uint64_t heap_base() {
+        std::lock_guard lock(mutex_);
+        return replay_.heap_base;
+    }
+
+    // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.
+    void add_pipeline(std::uintptr_t id, const ComputePipeline& pipeline) {
+        std::lock_guard lock(mutex_);
+        pipelines_[id] = pipeline;
+    }
+    void remove_pipeline(std::uintptr_t id) {
+        std::lock_guard lock(mutex_);
+        pipelines_.erase(id);
+    }
+
     // For tests and traces.
     VkImageLayout layout(ResourceId id, std::uint32_t subresource) {
         std::lock_guard lock(mutex_);
@@ -155,6 +187,7 @@ private:
     std::mutex mutex_;  // resources, tracker and views; held while a queue prepares and emits
     std::mutex submit_mutex_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
+    std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     LayoutTracker tracker_;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views_;
     ReplayFunctions replay_;

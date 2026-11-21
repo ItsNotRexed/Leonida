@@ -135,6 +135,15 @@ if(BUILD_TESTING)
   endif()
   add_executable(command_list_test test/command_list_test.cpp)
   add_test(NAME command_list COMMAND command_list_test)
+  add_executable(shader_library_test test/shader_library_test.cpp)
+  add_test(NAME shader_library COMMAND shader_library_test)
+  if(WIN32)
+    # Compares the root-signature parser with the PC serializer (d3d12.dll, loaded at run time).
+    add_executable(root_signature_test test/root_signature_test.cpp)
+    target_compile_definitions(root_signature_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(root_signature_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME root_signature COMMAND root_signature_test)
+  endif()
   if(WIN32)
     # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE are set.
     add_executable(bink_decode_test

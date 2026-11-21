@@ -219,6 +219,18 @@ What is implemented (all of it testable without the game):
   the inner device, so `GetDevice` always returns the Xbox-ABI object. All D3D12 queues share one graphics
   `VkQueue` behind a submit lock (question 12).
 
+Started for the compute path (no pipelines yet):
+- `runtime/src/shader_library.h` finds the translated SPIR-V for a shader the game hands to D3D12 (section 3.6).
+  It extracts the FSSM program from the DXBC container (DXIL → XDAT entry 0x0D → XBCH → zlib) and looks up its
+  SHA-256 as `fssm_sha256` in `spirv/index.json`. Its own inflate, SHA-256 and JSON reader keep it free of
+  dependencies (`shader_library_test`).
+- `runtime/src/root_signature.h` parses serialized root signatures (`RTS0`, bare or in a DXBC container) and lays
+  out the 32 user-data dwords by the section 3.5 default mapping. `root_signature_test` compares every field with
+  the PC runtime's serializer for v1.0 and v1.1, and checks a signature over 32 dwords and the Xbox flag byte.
+- The IR records `Dispatch` with its user data captured at record time. Replay binds the pipeline, pushes the
+  144-byte block (s0..s31, heap base, code base) and dispatches. Not wired up yet: the GPU address arena,
+  `CreateRootSignature`, compute PSOs and the command list's root-argument setters.
+
 Known gaps: the game's present entry point (DXGI factory/swapchain or `PresentX`; the presenter above is what
 either calls), HDR and fullscreen; shader-resource, UAV and constant-buffer views, samplers, root signatures, PSOs, draws, 3D and array
 copies through footprints with depth, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), MSAA, 1D/3D textures and the swapchain;
